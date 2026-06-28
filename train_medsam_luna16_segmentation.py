@@ -6,12 +6,12 @@ This script is for bowang-lab/MedSAM, not MedSAM2.
 It trains a promptless binary segmentation model on LUNA-style nodule-positive
 2D/2.5D slices:
 
-    CT slice/triplet -> MedSAM image encoder -> small segmentation head -> mask logits
+    CT slice/triplet -> MedSAM image encoder -> selectable CNN decoder/head -> mask logits
 
-The MedSAM prompt encoder and mask decoder are not used. This is intentional:
-it gives a simple fully-supervised baseline while still using MedSAM image features.
+The MedSAM prompt encoder and MedSAM mask decoder are not used. This is intentional:
+it gives a simple fully-supervised baseline while still using SAM image features.
 
-Dataset assumptions match the accompanying LUNA MedSAM inference script:
+Dataset assumptions match the accompanying LUNA SAM inference script:
     DATASET_DIR/CT_volumes/*.mhd
     DATASET_DIR/masks_nodules/nifti_data/*mask*contour*nodule*.nii.gz
     DATASET_DIR/annotations.csv
@@ -35,7 +35,7 @@ Outputs
 
 Example
 -------
-python train_medsam_luna_positive_slice_segmentation.py \
+python train_medsam_luna16_segmentation_aug_decoder.py \
   --dataset-dir /path/to/LUNA16 \
   --model-type vit_b \
   --checkpoint checkpoints/medsam_vit_b.pth \
@@ -123,31 +123,66 @@ def safe_autocast(device: torch.device, amp_dtype: str):
     return torch.autocast("cuda", dtype=dtype)
 
 
+def to_plain_python(obj):
+    """Recursively convert NumPy/Pandas/Path objects into YAML/JSON-safe Python types."""
+
+    # Handle NumPy scalars before Python primitive checks.
+    # In particular, np.str_ can behave like str for isinstance(), but PyYAML
+    # still cannot serialize it unless it is converted to a native Python str.
+    if isinstance(obj, np.generic):
+        return to_plain_python(obj.item())
+
+    if isinstance(obj, np.ndarray):
+        return [to_plain_python(v) for v in obj.tolist()]
+
+    if obj is None:
+        return None
+
+    if isinstance(obj, Path):
+        return str(obj)
+
+    if isinstance(obj, argparse.Namespace):
+        return {str(k): to_plain_python(v) for k, v in vars(obj).items()}
+
+    if isinstance(obj, dict):
+        return {str(to_plain_python(k)): to_plain_python(v) for k, v in obj.items()}
+
+    if isinstance(obj, (list, tuple, set)):
+        return [to_plain_python(v) for v in obj]
+
+    if isinstance(obj, float):
+        return None if math.isnan(obj) or math.isinf(obj) else float(obj)
+
+    if isinstance(obj, (str, int, bool)):
+        return obj
+
+    try:
+        if pd.isna(obj):
+            return None
+    except Exception:
+        pass
+
+    return str(obj)
+
+
 def namespace_to_plain_dict(args: argparse.Namespace) -> Dict:
-    out = {}
-    for k, v in vars(args).items():
-        if isinstance(v, Path):
-            out[k] = str(v)
-        elif isinstance(v, (tuple, list)):
-            out[k] = list(v)
-        else:
-            out[k] = v
-    return out
+    return to_plain_python(args)
 
 
 def write_config(path: Path, payload: Dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    payload = to_plain_python(payload)
     with open(path, "w") as f:
         if yaml is not None:
             yaml.safe_dump(payload, f, sort_keys=False, default_flow_style=False)
         else:
-            json.dump(payload, f, indent=2)
+            json.dump(payload, f, indent=2, allow_nan=False)
 
 
 def write_json(path: Path, payload) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w") as f:
-        json.dump(payload, f, indent=2)
+        json.dump(to_plain_python(payload), f, indent=2, allow_nan=False)
 
 
 def write_pred_volume(pred: np.ndarray, reference_image: sitk.Image, out_path: Path) -> None:
@@ -310,6 +345,102 @@ def build_medsam_input_slice(
         return np.stack([norm(z0), norm(z1), norm(z2)], axis=-1)
     ch = norm(z)
     return np.stack([ch, ch, ch], axis=-1)
+
+
+def resize_rgb_and_mask(rgb: np.ndarray, mask: np.ndarray, image_size: Optional[int]) -> Tuple[np.ndarray, np.ndarray]:
+    """Optionally resize a H,W,3 uint8 image and H,W binary mask to a square size."""
+    if image_size is None:
+        return rgb, mask
+    size = (int(image_size), int(image_size))
+    rgb_r = cv2.resize(rgb, size, interpolation=cv2.INTER_LINEAR)
+    mask_r = cv2.resize(mask.astype(np.uint8), size, interpolation=cv2.INTER_NEAREST)
+    return rgb_r, mask_r
+
+
+def resize_rgb_only(rgb: np.ndarray, image_size: Optional[int]) -> np.ndarray:
+    """Optionally resize a H,W,3 uint8 image to a square size."""
+    if image_size is None:
+        return rgb
+    size = (int(image_size), int(image_size))
+    return cv2.resize(rgb, size, interpolation=cv2.INTER_LINEAR)
+
+
+def build_augment_params(args: argparse.Namespace) -> Dict:
+    return {
+        "enabled": bool(args.augment),
+        "hflip_p": float(args.aug_hflip_p),
+        "vflip_p": float(args.aug_vflip_p),
+        "rotation_deg": float(args.aug_rotation_deg),
+        "shift_px": float(args.aug_shift_px),
+        "scale_min": float(args.aug_scale_min),
+        "scale_max": float(args.aug_scale_max),
+        "intensity_p": float(args.aug_intensity_p),
+        "brightness": float(args.aug_brightness),
+        "contrast": float(args.aug_contrast),
+        "noise_std": float(args.aug_noise_std),
+        "blur_p": float(args.aug_blur_p),
+    }
+
+
+def apply_train_augmentations(rgb: np.ndarray, mask: np.ndarray, params: Dict) -> Tuple[np.ndarray, np.ndarray]:
+    """Apply conservative 2D augmentations to a single training slice/mask pair.
+
+    Geometric transforms are shared by image and mask. Intensity transforms are
+    applied only to the image. The image remains uint8 H,W,3 and the mask remains
+    uint8 H,W. Augmentation is intentionally mild because LUNA nodules are small.
+    """
+    if not params or not params.get("enabled", False):
+        return rgb, mask
+
+    rgb = np.ascontiguousarray(rgb)
+    mask = np.ascontiguousarray(mask.astype(np.uint8))
+
+    if random.random() < params.get("hflip_p", 0.0):
+        rgb = np.ascontiguousarray(rgb[:, ::-1])
+        mask = np.ascontiguousarray(mask[:, ::-1])
+    if random.random() < params.get("vflip_p", 0.0):
+        rgb = np.ascontiguousarray(rgb[::-1, :])
+        mask = np.ascontiguousarray(mask[::-1, :])
+
+    H, W = mask.shape[:2]
+    rot = float(params.get("rotation_deg", 0.0))
+    shift = float(params.get("shift_px", 0.0))
+    scale_min = float(params.get("scale_min", 1.0))
+    scale_max = float(params.get("scale_max", 1.0))
+    if rot > 0 or shift > 0 or abs(scale_min - 1.0) > 1e-6 or abs(scale_max - 1.0) > 1e-6:
+        angle = random.uniform(-rot, rot) if rot > 0 else 0.0
+        scale = random.uniform(scale_min, scale_max) if scale_max > 0 else 1.0
+        tx = random.uniform(-shift, shift) if shift > 0 else 0.0
+        ty = random.uniform(-shift, shift) if shift > 0 else 0.0
+        M = cv2.getRotationMatrix2D((W / 2.0, H / 2.0), angle, scale)
+        M[0, 2] += tx
+        M[1, 2] += ty
+        rgb = cv2.warpAffine(
+            rgb, M, (W, H), flags=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_REFLECT_101,
+        )
+        mask = cv2.warpAffine(
+            mask, M, (W, H), flags=cv2.INTER_NEAREST,
+            borderMode=cv2.BORDER_CONSTANT, borderValue=0,
+        )
+
+    if random.random() < params.get("intensity_p", 0.0):
+        x = rgb.astype(np.float32)
+        contrast = float(params.get("contrast", 0.0))
+        brightness = float(params.get("brightness", 0.0))
+        if contrast > 0:
+            x *= random.uniform(1.0 - contrast, 1.0 + contrast)
+        if brightness > 0:
+            x += random.uniform(-brightness, brightness) * 255.0
+        noise_std = float(params.get("noise_std", 0.0))
+        if noise_std > 0:
+            x += np.random.normal(0.0, noise_std * 255.0, size=x.shape).astype(np.float32)
+        rgb = np.clip(x, 0.0, 255.0).astype(np.uint8)
+
+    if random.random() < params.get("blur_p", 0.0):
+        rgb = cv2.GaussianBlur(rgb, ksize=(3, 3), sigmaX=0.0)
+
+    return rgb.astype(np.uint8), (mask > 0).astype(np.uint8)
 
 
 def numpy_rgb_to_medsam_tensor(rgb: np.ndarray) -> torch.Tensor:
@@ -500,7 +631,7 @@ def split_volume_ids(
     test_case_list: Optional[str] = None,
     shuffle_splits: bool = True,
 ) -> Dict[str, List[str]]:
-    available = list(volume_ids)
+    available = [str(x) for x in volume_ids]
     available_set = set(available)
     explicit_train = read_case_list_file(train_case_list)
     explicit_val = read_case_list_file(val_case_list)
@@ -530,7 +661,7 @@ def split_volume_ids(
     ids = list(available)
     if shuffle_splits:
         rng = np.random.default_rng(seed)
-        ids = list(rng.permutation(ids))
+        ids = [str(x) for x in rng.permutation(ids)]
 
     n_total = len(ids)
     n_test = int(round(n_total * test_ratio))
@@ -574,6 +705,8 @@ class LUNAPositiveSliceSegDataset(Dataset):
         hu_max: float,
         min_component_area: int,
         cache_cases: bool = False,
+        resize_size: Optional[int] = None,
+        augment_params: Optional[Dict] = None,
     ):
         self.index = index
         self.volume_ids = list(volume_ids)
@@ -583,6 +716,8 @@ class LUNAPositiveSliceSegDataset(Dataset):
         self.hu_max = hu_max
         self.min_component_area = min_component_area
         self.cache_cases = cache_cases
+        self.resize_size = resize_size
+        self.augment_params = augment_params or {"enabled": False}
         self._case_cache: Dict[str, CaseData] = {}
         self.samples = self._build_samples()
         if not self.samples:
@@ -626,25 +761,41 @@ class LUNAPositiveSliceSegDataset(Dataset):
             hu_min=self.hu_min,
             hu_max=self.hu_max,
         )
+        mask = case.gt_volume[s.z].astype(np.uint8)
+        rgb, mask = resize_rgb_and_mask(rgb, mask, self.resize_size)
+        rgb, mask = apply_train_augmentations(rgb, mask, self.augment_params)
         image = numpy_rgb_to_medsam_tensor(rgb)
-        mask = torch.from_numpy(case.gt_volume[s.z].astype(np.float32))[None]
-        H, W = case.gt_volume.shape[1:]
+        mask_t = torch.from_numpy(mask.astype(np.float32))[None]
+        H, W = mask.shape
         return {
             "image": image,
-            "mask": mask,
+            "mask": mask_t,
             "series_id": s.series_id,
             "z": int(s.z),
             "image_hw": torch.tensor([H, W], dtype=torch.long),
         }
 
-
 def collate_seg(batch: List[Dict]) -> Dict:
+    """Collate function shared by train/val/test slice datasets.
+
+    Some datasets include image_hw explicitly, while case-level evaluation
+    datasets may only provide image/mask/series_id/z. Build image_hw from the
+    mask shape as a fallback so the same collate function is safe in both paths.
+    """
+    if "image_hw" in batch[0]:
+        image_hw = torch.stack([b["image_hw"] for b in batch], dim=0)
+    else:
+        image_hw = torch.tensor(
+            [[int(b["mask"].shape[-2]), int(b["mask"].shape[-1])] for b in batch],
+            dtype=torch.long,
+        )
+
     return {
         "image": torch.stack([b["image"] for b in batch], dim=0),
         "mask": torch.stack([b["mask"] for b in batch], dim=0),
         "series_id": [b["series_id"] for b in batch],
         "z": torch.tensor([b["z"] for b in batch], dtype=torch.long),
-        "image_hw": torch.stack([b["image_hw"] for b in batch], dim=0),
+        "image_hw": image_hw,
     }
 
 
@@ -654,28 +805,90 @@ def collate_seg(batch: List[Dict]) -> Dict:
 
 
 class ConvGNAct(nn.Module):
-    def __init__(self, in_ch: int, out_ch: int, groups: int = 8):
+    def __init__(self, in_ch: int, out_ch: int, groups: int = 8, dropout: float = 0.0):
         super().__init__()
         g = min(groups, out_ch)
         while out_ch % g != 0 and g > 1:
             g -= 1
-        self.net = nn.Sequential(
+        layers: List[nn.Module] = [
             nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=1),
             nn.GroupNorm(g, out_ch),
             nn.GELU(),
-        )
+        ]
+        if dropout > 0:
+            layers.append(nn.Dropout2d(p=float(dropout)))
+        self.net = nn.Sequential(*layers)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.net(x)
 
 
-class MedSAMEncoderSegmentationModel(nn.Module):
-    """MedSAM image encoder + supervised segmentation head.
+class SimpleDecoder(nn.Module):
+    """Original lightweight decoder: refine final MedSAM image embedding, then predict."""
 
-    MedSAM's official inference path resizes each image to 1024x1024 and min-max
-    normalizes it to [0, 1] before calling `image_encoder` directly. This model
-    follows that convention instead of SAM's RGB mean/std preprocessing.
+    def __init__(self, in_ch: int = 256, decoder_dim: int = 256, dropout: float = 0.0):
+        super().__init__()
+        self.net = nn.Sequential(
+            ConvGNAct(in_ch, decoder_dim, dropout=dropout),
+            ConvGNAct(decoder_dim, decoder_dim, dropout=dropout),
+            nn.Conv2d(decoder_dim, 1, kernel_size=1),
+        )
+
+    def forward(self, feat: torch.Tensor) -> torch.Tensor:
+        return self.net(feat)
+
+
+class DeepDecoder(nn.Module):
+    """Deeper low-resolution decoder using only the final SAM image embedding."""
+
+    def __init__(self, in_ch: int = 256, decoder_dim: int = 256, depth: int = 4, dropout: float = 0.0):
+        super().__init__()
+        depth = max(1, int(depth))
+        layers: List[nn.Module] = [ConvGNAct(in_ch, decoder_dim, dropout=dropout)]
+        for _ in range(depth):
+            layers.append(ConvGNAct(decoder_dim, decoder_dim, dropout=dropout))
+        layers.append(nn.Conv2d(decoder_dim, 1, kernel_size=1))
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, feat: torch.Tensor) -> torch.Tensor:
+        return self.net(feat)
+
+
+class ProgressiveUpsampleDecoder(nn.Module):
+    """U-Net/FPN-style progressive upsampling decoder for MedSAM.
+
+    MedSAM's image encoder returns a final dense embedding rather than
+    the multi-scale feature pyramid returned by SAM2. Therefore, for MedSAM,
+    --decoder-type fpn means a top-down/progressive upsampling decoder starting
+    from the final MedSAM embedding. It does not use true encoder skip connections,
+    but it gives the decoder several higher-resolution refinement stages before
+    the final mask prediction.
     """
+
+    def __init__(self, in_ch: int = 256, decoder_dim: int = 256, num_levels: int = 3, smooth_blocks: int = 1, dropout: float = 0.0):
+        super().__init__()
+        self.num_levels = max(1, int(num_levels))
+        smooth_blocks = max(1, int(smooth_blocks))
+        self.proj = ConvGNAct(in_ch, decoder_dim, dropout=dropout)
+        self.level_blocks = nn.ModuleList()
+        for _ in range(self.num_levels):
+            blocks: List[nn.Module] = []
+            for _ in range(smooth_blocks):
+                blocks.append(ConvGNAct(decoder_dim, decoder_dim, dropout=dropout))
+            self.level_blocks.append(nn.Sequential(*blocks))
+        self.out_conv = nn.Conv2d(decoder_dim, 1, kernel_size=1)
+
+    def forward(self, feat: torch.Tensor) -> torch.Tensor:
+        x = self.proj(feat)
+        for i, block in enumerate(self.level_blocks):
+            if i > 0:
+                x = F.interpolate(x, scale_factor=2.0, mode="bilinear", align_corners=False)
+            x = block(x)
+        return self.out_conv(x)
+
+
+class MedSAMEncoderSegmentationModel(nn.Module):
+    """MedSAM image encoder + selectable supervised segmentation decoder."""
 
     def __init__(
         self,
@@ -683,13 +896,18 @@ class MedSAMEncoderSegmentationModel(nn.Module):
         head_dim: int = 256,
         freeze_encoder: bool = True,
         medsam_feature_channels: int = 256,
-        image_size: int = 1024,
+        decoder_type: str = "simple",
+        decoder_depth: int = 4,
+        fpn_levels: int = 3,
+        decoder_dropout: float = 0.0,
+        encoder_image_size: int = 1024,
     ):
         super().__init__()
         self.sam = sam_model
         self.image_encoder = sam_model.image_encoder
         self.freeze_encoder = bool(freeze_encoder)
-        self.image_size = int(image_size)
+        self.decoder_type = str(decoder_type)
+        self.image_size = int(encoder_image_size)
 
         # Only the image encoder is used. Keep prompt/mask decoders frozen because they are unused.
         for p in self.sam.parameters():
@@ -698,15 +916,26 @@ class MedSAMEncoderSegmentationModel(nn.Module):
             for p in self.image_encoder.parameters():
                 p.requires_grad = True
 
-        self.seg_head = nn.Sequential(
-            ConvGNAct(medsam_feature_channels, head_dim),
-            ConvGNAct(head_dim, head_dim),
-            nn.Conv2d(head_dim, 1, kernel_size=1),
-        )
+
+        if self.decoder_type == "simple":
+            self.seg_head = SimpleDecoder(in_ch=medsam_feature_channels, decoder_dim=head_dim, dropout=decoder_dropout)
+        elif self.decoder_type == "deep":
+            self.seg_head = DeepDecoder(in_ch=medsam_feature_channels, decoder_dim=head_dim, depth=decoder_depth, dropout=decoder_dropout)
+        elif self.decoder_type == "fpn":
+            self.seg_head = ProgressiveUpsampleDecoder(
+                in_ch=medsam_feature_channels,
+                decoder_dim=head_dim,
+                num_levels=fpn_levels,
+                smooth_blocks=decoder_depth,
+                dropout=decoder_dropout,
+            )
+        else:
+            raise ValueError(f"Unknown decoder_type={decoder_type!r}. Use simple, deep, or fpn.")
 
     def preprocess_for_medsam_encoder(self, x: torch.Tensor) -> torch.Tensor:
-        # x is B,3,H,W in [0,255]. Resize to MedSAM's square training/inference
-        # resolution, then min-max normalize each image to [0, 1].
+        # x is B,3,H,W in [0,255]. Resize to MedSAM's square encoder
+        # resolution, then min-max normalize each image to [0, 1], matching
+        # the common MedSAM inference/preprocessing convention.
         x = F.interpolate(x, size=(self.image_size, self.image_size), mode="bilinear", align_corners=False)
         x_min = x.amin(dim=(1, 2, 3), keepdim=True)
         x_max = x.amax(dim=(1, 2, 3), keepdim=True)
@@ -726,8 +955,8 @@ class MedSAMEncoderSegmentationModel(nn.Module):
         if output_hw is None:
             output_hw = tuple(x.shape[-2:])
         feat = self.extract_features(x)
-        logits = self.seg_head(feat)
-        logits = F.interpolate(logits, size=output_hw, mode="bilinear", align_corners=False)
+        logits_low = self.seg_head(feat)
+        logits = F.interpolate(logits_low, size=output_hw, mode="bilinear", align_corners=False)
         return logits
 
 
@@ -741,15 +970,19 @@ def build_medsam_model(args: argparse.Namespace, device: torch.device):
 
 def build_seg_model(args: argparse.Namespace, device: torch.device) -> MedSAMEncoderSegmentationModel:
     sam = build_medsam_model(args, device)
+    decoder_dim = args.decoder_dim if args.decoder_dim is not None else args.head_dim
     model = MedSAMEncoderSegmentationModel(
         sam_model=sam,
-        head_dim=args.head_dim,
+        head_dim=decoder_dim,
         freeze_encoder=not args.unfreeze_encoder,
         medsam_feature_channels=args.medsam_feature_channels,
-        image_size=args.image_size,
+        decoder_type=args.decoder_type,
+        decoder_depth=args.decoder_depth,
+        fpn_levels=args.fpn_levels,
+        decoder_dropout=args.decoder_dropout,
+        encoder_image_size=args.image_size,
     ).to(device)
     return model
-
 
 # =============================================================================
 # Losses
@@ -795,7 +1028,11 @@ def build_experiment_name(args: argparse.Namespace) -> str:
         args.run_name,
         "medsam-posslice-seg",
         args.model_type,
-        f"im{args.image_size}",
+        f"dec-{args.decoder_type}",
+        f"ddim{args.decoder_dim if args.decoder_dim is not None else args.head_dim}",
+        "aug" if args.augment else "noaug",
+        f"enc{args.image_size}",
+        f"resize{args.resize_size}" if args.resize_size else "native",
         "triplet" if args.use_triplet_channels else "singlech",
         "window" if args.use_ct_window else "normslice",
         f"ep{args.epochs}",
@@ -1021,12 +1258,22 @@ def summarize_by_patient(df: pd.DataFrame, id_col: str, metric_cols: Sequence[st
 
 
 class CasePositiveSliceDataset(Dataset):
-    def __init__(self, case: CaseData, use_triplet_channels: bool, use_ct_window: bool, hu_min: float, hu_max: float, min_component_area: int):
+    def __init__(
+        self,
+        case: CaseData,
+        use_triplet_channels: bool,
+        use_ct_window: bool,
+        hu_min: float,
+        hu_max: float,
+        min_component_area: int,
+        resize_size: Optional[int] = None,
+    ):
         self.case = case
         self.use_triplet_channels = use_triplet_channels
         self.use_ct_window = use_ct_window
         self.hu_min = hu_min
         self.hu_max = hu_max
+        self.resize_size = resize_size
         self.zs = positive_slices_for_case(case, min_component_area=min_component_area)
 
     def __len__(self) -> int:
@@ -1042,13 +1289,18 @@ class CasePositiveSliceDataset(Dataset):
             hu_min=self.hu_min,
             hu_max=self.hu_max,
         )
+        # Use the same optional image resize at evaluation as during training.
+        # Keep the target mask at native resolution; the model forward call passes
+        # output_hw=(native_H, native_W), so predictions are written back correctly.
+        rgb = resize_rgb_only(rgb, self.resize_size)
+        H, W = self.case.gt_volume.shape[1:]
         return {
             "image": numpy_rgb_to_medsam_tensor(rgb),
             "mask": torch.from_numpy(self.case.gt_volume[z].astype(np.float32))[None],
             "series_id": self.case.series_id,
             "z": int(z),
+            "image_hw": torch.tensor([H, W], dtype=torch.long),
         }
-
 
 def predict_case_positive_slices(
     model: MedSAMEncoderSegmentationModel,
@@ -1063,6 +1315,7 @@ def predict_case_positive_slices(
         hu_min=args.hu_min,
         hu_max=args.hu_max,
         min_component_area=args.min_component_area,
+        resize_size=args.resize_size,
     )
     pred_volume = np.zeros_like(case.gt_volume, dtype=np.uint8)
     slice_rows: List[Dict] = []
@@ -1296,6 +1549,8 @@ def train(args: argparse.Namespace) -> None:
         hu_max=args.hu_max,
         min_component_area=args.min_component_area,
         cache_cases=args.cache_cases,
+        resize_size=args.resize_size,
+        augment_params=build_augment_params(args),
     )
     val_ids = splits["val"] if splits["val"] else splits["train"]
     val_ds = LUNAPositiveSliceSegDataset(
@@ -1307,6 +1562,8 @@ def train(args: argparse.Namespace) -> None:
         hu_max=args.hu_max,
         min_component_area=args.min_component_area,
         cache_cases=args.cache_cases,
+        resize_size=args.resize_size,
+        augment_params={"enabled": False},
     )
 
     train_loader = DataLoader(
@@ -1332,6 +1589,8 @@ def train(args: argparse.Namespace) -> None:
     trainable_params = [p for p in model.parameters() if p.requires_grad]
     if not trainable_params:
         raise RuntimeError("No trainable parameters. This should not happen because the segmentation head should be trainable.")
+    print(f"Decoder: type={args.decoder_type}, dim={args.decoder_dim if args.decoder_dim is not None else args.head_dim}, depth={args.decoder_depth}, fpn_levels={args.fpn_levels}, dropout={args.decoder_dropout}")
+    print(f"Augmentation enabled: {args.augment}")
     optimizer = torch.optim.AdamW(trainable_params, lr=args.lr, weight_decay=args.weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(args.epochs, 1))
     scaler = torch.cuda.amp.GradScaler(enabled=(device.type == "cuda" and args.amp_dtype == "fp16"))
@@ -1428,9 +1687,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     # Model
     parser.add_argument("--model-type", default="vit_b", choices=["default", "vit_h", "vit_l", "vit_b"], help="MedSAM is usually vit_b.")
     parser.add_argument("--checkpoint", required=True, help="MedSAM checkpoint, e.g. medsam_vit_b.pth")
-    parser.add_argument("--image-size", type=int, default=1024, help="MedSAM encoder input resolution. Official MedSAM uses 1024.")
     parser.add_argument("--medsam-feature-channels", type=int, default=256, help="MedSAM image encoder output channels. MedSAM/SAM ViT models normally use 256.")
-    parser.add_argument("--head-dim", type=int, default=256)
+    parser.add_argument("--head-dim", type=int, default=256, help="Backward-compatible decoder channel width. Used when --decoder-dim is not set.")
+    parser.add_argument("--decoder-type", choices=["simple", "deep", "fpn"], default="simple", help="Segmentation decoder/head. simple keeps the original head, deep uses more conv blocks, fpn uses progressive U-Net/FPN-style upsampling from the final MedSAM embedding.")
+    parser.add_argument("--decoder-dim", type=int, default=None, help="Decoder channel width. If omitted, --head-dim is used for backward compatibility.")
+    parser.add_argument("--decoder-depth", type=int, default=4, help="For deep: number of ConvGNAct blocks. For fpn: smoothing ConvGNAct blocks per upsampling level.")
+    parser.add_argument("--fpn-levels", type=int, default=3, help="For MedSAM, number of progressive upsampling/refinement levels when --decoder-type fpn.")
+    parser.add_argument("--decoder-dropout", type=float, default=0.0, help="Optional Dropout2d probability inside decoder blocks.")
     parser.add_argument("--unfreeze-encoder", action="store_true", help="Fine-tune MedSAM image encoder as well as the segmentation head.")
 
     # Runtime/training
@@ -1451,11 +1714,27 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--min-delta", type=float, default=1e-5)
     parser.add_argument("--cache-cases", action="store_true")
 
+    # Augmentation; applied only to the training split after optional resize.
+    parser.add_argument("--augment", action=argparse.BooleanOptionalAction, default=False, help="Enable conservative 2D augmentations for training slices only.")
+    parser.add_argument("--aug-hflip-p", type=float, default=0.5)
+    parser.add_argument("--aug-vflip-p", type=float, default=0.5)
+    parser.add_argument("--aug-rotation-deg", type=float, default=15.0)
+    parser.add_argument("--aug-shift-px", type=float, default=16.0)
+    parser.add_argument("--aug-scale-min", type=float, default=0.90)
+    parser.add_argument("--aug-scale-max", type=float, default=1.10)
+    parser.add_argument("--aug-intensity-p", type=float, default=0.8)
+    parser.add_argument("--aug-brightness", type=float, default=0.10, help="Brightness jitter as a fraction of 255.")
+    parser.add_argument("--aug-contrast", type=float, default=0.10, help="Contrast jitter fraction around 1.0.")
+    parser.add_argument("--aug-noise-std", type=float, default=0.02, help="Gaussian noise std as a fraction of 255.")
+    parser.add_argument("--aug-blur-p", type=float, default=0.10, help="Probability of mild 3x3 Gaussian blur.")
+
     # CT/slice input
     parser.add_argument("--use-triplet-channels", action="store_true", help="Use z-1/z/z+1 as RGB channels.")
     parser.add_argument("--use-ct-window", action=argparse.BooleanOptionalAction, default=True, help="Use fixed CT window before uint8 conversion. If false, per-slice min-max normalization is used.")
     parser.add_argument("--hu-min", type=float, default=-1000.0)
     parser.add_argument("--hu-max", type=float, default=400.0)
+    parser.add_argument("--image-size", type=int, default=1024, help="MedSAM encoder input resolution. Official MedSAM commonly uses 1024.")
+    parser.add_argument("--resize-size", type=int, default=None, help="Optional square resize before MedSAM encoder preprocessing. Training masks are resized to this size; evaluation predictions are written back at native size. Comparable to --image-size in SAM2/MedSAM2 scripts.")
     parser.add_argument("--min-component-area", type=int, default=1)
 
     # Outputs
@@ -1491,6 +1770,18 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("Need non-negative --bce-weight/--dice-weight with positive sum")
     if not (0 <= args.threshold <= 1):
         raise ValueError("--threshold must be in [0,1]")
+    if args.image_size <= 0:
+        raise ValueError("--image-size must be positive")
+    if args.resize_size is not None and args.resize_size <= 0:
+        raise ValueError("--resize-size must be positive when provided")
+    if args.decoder_dim is not None and args.decoder_dim <= 0:
+        raise ValueError("--decoder-dim must be positive when provided")
+    if args.decoder_depth <= 0:
+        raise ValueError("--decoder-depth must be positive")
+    if args.fpn_levels <= 0:
+        raise ValueError("--fpn-levels must be positive")
+    if not (0.0 <= args.decoder_dropout < 1.0):
+        raise ValueError("--decoder-dropout must be in [0,1)")
 
 
 def main() -> None:
